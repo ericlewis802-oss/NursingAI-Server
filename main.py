@@ -1,131 +1,88 @@
+import os
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import requests
-import os
-import json
+
+POE_ACCESS_KEY = os.environ.get("POE_ACCESS_KEY")
+HEADERS = {"Authorization": f"Bearer {POE_ACCESS_KEY}"}
 
 app = FastAPI()
 
-POE_ACCESS_KEY = os.environ.get("POE_ACCESS_KEY")
-POE_API_URL = "https://api.poe.com/bot/"
 
-
-def call_poe_model(model, messages, attachments=None, search=False):
-    """Send a request to a Poe model and return output text."""
-    url = POE_API_URL + model
-
-    payload = {
-        "messages": messages,
-        "search": search
-    }
-
-    if attachments:
-        payload["attachments"] = attachments
-
-    headers = {
-        "Authorization": f"Bearer {POE_ACCESS_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    response = requests.post(url, json=payload, headers=headers)
+# --------------------------------------------------------------------
+# Call Poe Model Helper
+# --------------------------------------------------------------------
+def call_poe_model(model, messages):
+    response = requests.post(
+        f"https://api.poe.com/bot/{model}",
+        headers=HEADERS,
+        json={"messages": messages},
+        timeout=120
+    )
     response.raise_for_status()
-    data = response.json()
-    return data.get("output_text", "")
+    return response.json()["output_text"]
 
 
-# ---------------------------------------------------------
-# HEALTH CHECK ENDPOINT (Poe requires GET / to succeed)
-# ---------------------------------------------------------
+# --------------------------------------------------------------------
+# Health Check
+# --------------------------------------------------------------------
 @app.get("/")
-async def root():
+async def health():
     return {"status": "ok", "message": "NursingAI server running"}
 
 
-# ---------------------------------------------------------
-# MAIN WEBHOOK ENDPOINT
-# ---------------------------------------------------------
-@app.post("/")
+# --------------------------------------------------------------------
+# Main Webhook (Poe → Your Server)
+# --------------------------------------------------------------------
+@app.post("/poe_webhook")
 async def poe_webhook(request: Request):
-    body = await request.json()
+    data = await request.json()
 
-    # Ignore empty POST requests (health checks)
-    if not body or body == {}:
-        return {"response": "OK"}
+    ############################
+    # Get message content
+    ############################
+    text = data.get("message", "")
+    attachments = data.get("attachments", [])
+    messages = [{"role": "user", "content": text}]
 
-    # Ignore requests with no message and no attachments
-    if not body.get("message") and not body.get("attachments"):
-        return {"response": "OK"}
+    ############################
+    # CASE 1: Attachment → OCR → Analyze → Flashcards
+    ############################
+    if attachments:
+        # ---- 1) OCR with GPT‑4o ----
+        ocr_text = call_poe_model(
+            "gpt-4o",
+            [{"role": "user", "content": f"OCR this: {attachments}"}]
+        )
 
-    user_message = body.get("message", "")
-    attachments = body.get("attachments", [])
-    user_context = body.get("user_context", "")
-
-    # -----------------------------------------------------
-    # NO ATTACHMENTS → CONVERSATION MODE
-    # -----------------------------------------------------
-    if not attachments:
-        messages = [{"role": "user", "content": user_message}]
-        reply = call_poe_model("gemini-2.5-flash", messages)
-        return {"response": reply}
-
-    # -----------------------------------------------------
-    # STEP 1 — OCR EXTRACTION USING GPT‑4o
-    # -----------------------------------------------------
-    extracted_text = call_poe_model(
-        "gpt-4o",
-        [{"role": "system", "content": "Extract all text from the attachments. Do NOT summarize."}],
-        attachments=attachments
-    )
-
-    # -----------------------------------------------------
-    # STEP 2 — ANALYSIS USING GPT‑5.1
-    # -----------------------------------------------------
-    analysis_prompt = f"""
-Analyze this medical content and return ONLY JSON as described.
-
-Content:
-{extracted_text}
-
-User context:
-{user_context}
-
-Return ONLY clean JSON with no explanations outside the JSON object.
-"""
-
-    try:
-        analysis_json_raw = call_poe_model(
+        # ---- 2) Analyze for nursing/medical content ----
+        analysis_prompt = (
+            "Analyze the following text and return JSON:\n"
+            "1. medical_topics: list\n"
+            "2. needs_web_search: true/false\n"
+            f"Text:\n{ocr_text}"
+        )
+        analysis_raw = call_poe_model(
             "gpt-5.1",
             [{"role": "user", "content": analysis_prompt}]
         )
-        analysis = json.loads(analysis_json_raw)
-        needs_web = analysis.get("needs_web_search", True)
-    except:
-        analysis_json_raw = "{}"
-        needs_web = True
 
-    # -----------------------------------------------------
-    # STEP 3 — FLASHCARD GENERATION USING GPT‑5.1
-    # -----------------------------------------------------
-    flashcard_prompt = f"""
-SYSTEM PROMPT:
-You are NursingAI — generate STRICTLY formatted medical flashcards.
-Follow ALL flashcard rules the user previously defined.
+        # ---- 3) Generate flashcards ----
+        fc_prompt = (
+            "Generate strictly formatted medical flashcards.\n"
+            f"TEXT:\n{ocr_text}\n\n"
+            f"ANALYSIS JSON:\n{analysis_raw}"
+        )
+        flashcards = call_poe_model(
+            "gpt-5.1",
+            [{"role": "user", "content": fc_prompt}]
+        )
 
-<analysis_json>
-{analysis_json_raw}
-</analysis_json>
+        return JSONResponse({"reply": flashcards})
 
-<content>
-{extracted_text}
-</content>
+    ############################
+    # CASE 2: No attachment → Normal chat
+    ############################
+    reply = call_poe_model("gpt-4o-mini", messages)
 
-BEGIN FLASHCARD GENERATION NOW.
-"""
-
-    flashcards = call_poe_model(
-        "gpt-5.1",
-        [{"role": "user", "content": flashcard_prompt}],
-        search=needs_web
-    )
-
-    return {"response": flashcards}
+    return JSONResponse({"reply": reply})
